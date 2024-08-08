@@ -1,15 +1,16 @@
-local ziparchive = require 'ziparchive'
-local xmlize = require 'xmlize'
+local zip = require('brimworks.zip')
+local xmlize = require('xmlize')
 
 local M = {}
 
 local colRowPattern = "([a-zA-Z]*)(%d*)"
 
-local function _xlsx_readdocument(xlsx, documentName)
-    local file = xlsx.archive:fileopen(documentName)
+local function _xlsx_readdocument(tbl, documentName)
+    local xlsx = zip.open(tbl.filename)
+    local file = xlsx:open(documentName)
     if not file then return end
-    local buffer = xlsx.archive:fileread(file)
-    xlsx.archive:fileclose(file)
+    local buffer = file:read(8192)
+    xlsx:close(file)
     return xmlize.luaize(buffer)
 end
 
@@ -106,16 +107,21 @@ local __sheetMetatable = {
                                 data = data == '1'
                             else
                                 local cellS = tonumber(columnNode['@'].s)
-                                local numberStyle = self.workbook.styles.cellXfs[cellS - 1].numFmtId
-                                if not numberStyle then
-                                    numberStyle = 0
-                                end
-                                if numberStyle == 0  or  numberStyle == 1 then
-                                    colType = __cellMetatable.INT
+                                if cellS then
+                                    local numberStyle = self.workbook.styles.cellXfs[cellS].numFmtId
+                                    if not numberStyle then
+                                        numberStyle = 0
+                                    end
+                                    if numberStyle == 0  or  numberStyle == 1 then
+                                        colType = __cellMetatable.INT
+                                    else
+                                        colType = __cellMetatable.DOUBLE
+                                    end
+                                    data = tonumber(data)
                                 else
-                                    colType = __cellMetatable.DOUBLE
+                                    local cellR = columnNode['@'].r
+                                    colType = __cellMetatable.INT
                                 end
-                                data = tonumber(data)
                             end
 
                             --local formula
@@ -260,10 +266,9 @@ local __workbookMetatable = {
 
 function M.Workbook(filename)
     local self = {}
+    self.filename = filename
 
-    self.archive = ziparchive.open(filename)
-
-    local sharedStringsXml = _xlsx_readdocument(self, 'xl/sharedstrings.xml')
+    local sharedStringsXml = _xlsx_readdocument(self, 'xl/sharedStrings.xml')
     self.sharedStrings = {}
     if sharedStringsXml then
         for _, str in ipairs(sharedStringsXml.sst[1]['#'].si) do
@@ -310,28 +315,9 @@ function M.Workbook(filename)
         self.__sheets[name] = sheet
         id = id + 1
     end
+
     setmetatable(self, __workbookMetatable)
     return self
 end
 
 return M
-
---[[
-xlsx = M
-
-local workbook = xlsx.Workbook('Book1.xlsx')
-print("Book")
-local sheet = workbook[1]
-print(sheet:Cell(0, 52))
-cell = sheet:Cell(0, 52)
-print(cell.value)
-print(cell:Get())
-print(workbook:GetTotalWorksheets())
-print(sheet:rows())
-print(sheet:cols())
-print(sheet.B1)
-
-
---]]
-
--- vim: set tabstop=4 expandtab:
