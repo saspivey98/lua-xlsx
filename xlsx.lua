@@ -1,3 +1,10 @@
+--[[
+* lua-xlsx
+*
+* Based on the original implementation by Josh Jensen.
+* Modified to be compatible with Lua 5.3 and libzip by Simon Spivey.
+*
+--]]
 local zip = require('brimworks.zip')
 local xmlize = require('xmlize')
 
