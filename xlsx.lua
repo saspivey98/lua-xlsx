@@ -2,228 +2,198 @@
 * lua-xlsx
 *
 * Based on the original implementation by Josh Jensen.
-* Modified to be compatible with Lua 5.3 and libzip by Simon Spivey.
+* Modified to be compatible with Lua 5.3 and lib-zip by Simon Spivey.
 *
 --]]
-local zip = require('brimworks.zip')
-local xmlize = require('xmlize')
 
-local M = {}
+---The module lua-xlsx allows read access to .xlsx files.
+---@class lua-xlsx
+local lib = {}
+
+---return file info; for embedded purposes
+---@private
+function lib:INFO(_)
+    local info = {}
+    for k in pairs(self) do table.insert(info, k) end
+    return {
+        version = {
+            major = 0,
+            minor = 1,
+            revision = 1,
+        },
+        library = {
+            modulename = "lua-xlsx"
+        },
+        dependencies = {
+            "lua-zip",
+            "luaexpat"
+        },
+        functions = info
+    }
+end
+
+local ZIP = require('brimworks.zip')
+local lxp = require('lxp')
 
 local colRowPattern = "([a-zA-Z]*)(%d*)"
+local A_BYTE = string.byte('A')
 
-local function _xlsx_readdocument(tbl, documentName)
-    local xlsx = zip.open(tbl.filename)
-    local file = xlsx:open(documentName)
-    if not file then return end
-    local buffer = file:read(8192)
-    xlsx:close(file)
-    return xmlize.luaize(buffer)
-end
+--[[
+Builds the same "@" / "#" node shape used throughout this file:
+    node['@']  -> table of attributes (always present, may be empty)
+    node['#']  -> either a string (leaf text content), or a table
+                  mapping child tag name -> array of child nodes
+--]]
+local function _xlsx_parsexml(data)
+    local root = {}
+    local stack = { root }
 
-local __cellMetatable = {
-    UNDEFINED = 0,
-    INT = 1,
-    DOUBLE = 2,
-    STRING = 3,
-    WSTRING = 4,
-    FORMULA = 5,
-    BOOLEAN = 6,
+    local callbacks = {}
 
-    Get = function(self)
-        return self.value
-    end,
-
-    GetBoolean = function(self)
-        return self.value
-    end,
-
-    GetInteger = function(self)
-        return self.value
-    end,
-
-    GetDouble = function(self)
-        return self.value
-    end,
-
-    GetString = function(self)
-        return self.value
-    end,
-}
-
-__cellMetatable.__index = __cellMetatable
-
-function __cellMetatable:Type()
-    return self.type
-end
-
-local function Cell(rowNum, colNum, value, type, formula)
-    return setmetatable({
-        row = tonumber(rowNum),
-        column = colNum,
-        value = value,
-        type = type  or  __cellMetatable.UNDEFINED,
-        formula = formula,
-    }, __cellMetatable)
-end
-
-local __colTypeTranslator = {
-    b = __cellMetatable.BOOLEAN,
-    s = __cellMetatable.STRING,
-}
-
-local __sheetMetatable = {
-    __load = function(self)
-        local sheetDoc = _xlsx_readdocument(self.workbook, ("xl/worksheets/sheet%d.xml"):format(self.id))
-        local sheetData = sheetDoc.worksheet[1]['#'].sheetData
-        local rows = {}
-        local columns = {}
-        if sheetData[1]['#'].row then
-            for _, rowNode in ipairs(sheetData[1]['#'].row) do
-                local rowNum = tonumber(rowNode['@'].r)
-                if not rows[rowNum] then
-                    rows[rowNum] = {}
-                end
-                if rowNode['#'].c then
-                    for _, columnNode in ipairs(rowNode['#'].c) do
-                        -- Generate the proper column index.
-                        local cellId = columnNode['@'].r
-                        local colLetters = cellId:match(colRowPattern)
-                        local colNum = 0
-                        if colLetters then
-                            local index = 1
-                            repeat
-                                colNum = colNum * 26
-                                colNum = colNum + colLetters:byte(index) - ('A'):byte(1) + 1
-                                index = index + 1
-                            until index > #colLetters
-                        end
-
-                        local colType = columnNode['@'].t
-
-                        local data
-                        if columnNode['#'].v then
-                            data = columnNode['#'].v[1]['#']
-                            if colType == 's' then
-                                colType = __cellMetatable.STRING
-                                data = self.workbook.sharedStrings[tonumber(data) + 1]
-                            elseif colType == 'str' then
-                                colType = __cellMetatable.STRING
-                            elseif colType == 'b' then
-                                colType = __cellMetatable.BOOLEAN
-                                data = data == '1'
-                            else
-                                local cellS = tonumber(columnNode['@'].s)
-                                if cellS then
-                                    local numberStyle = self.workbook.styles.cellXfs[cellS].numFmtId
-                                    if not numberStyle then
-                                        numberStyle = 0
-                                    end
-                                    if numberStyle == 0  or  numberStyle == 1 then
-                                        colType = __cellMetatable.INT
-                                    else
-                                        colType = __cellMetatable.DOUBLE
-                                    end
-                                    data = tonumber(data)
-                                else
-                                    local cellR = columnNode['@'].r
-                                    colType = __cellMetatable.INT
-                                end
-                            end
-
-                            --local formula
-                            --if columnNode['#'].f then
-                                --assert()
-                            --end
-
-                        else
-                            colType = __colTypeTranslator[colType]
-                        end
-
-                        if not columns[colNum] then
-                            columns[colNum] = {}
-                        end
-                        local cell = Cell(rowNum, colNum, data, colType, formula)
-                        table.insert(rows[rowNum], cell)
-                        table.insert(columns[colNum], cell)
-                        self.__cells[cellId] = cell
-                    end
-                end
+    function callbacks.StartElement(_, name, attrs)
+        local cleanAttrs = {}
+        for k, v in pairs(attrs) do
+            if type(k) == 'string' then
+                cleanAttrs[k] = v
             end
         end
-        self.__rows = rows
-        self.__cols = columns
-        self.loaded = true
-    end,
 
-    rows = function(self)
-        if not self.loaded then
-            self.__load()
+        local node = { ['@'] = cleanAttrs }
+
+        local parent = stack[#stack]
+        if type(parent['#']) ~= 'table' then
+            parent['#'] = {}
         end
-        return self.__rows
-    end,
-
-    cols = function(self)
-        if not self.loaded then
-            self.__load()
+        local siblings = parent['#'][name]
+        if not siblings then
+            siblings = {}
+            parent['#'][name] = siblings
         end
-        return self.__cols
-    end,
+        siblings[#siblings + 1] = node
 
-    GetAnsiSheetName = function(self)
-        return self.name
-    end,
-
-    GetUnicodeSheetName = function(self)
-        return self.name
-    end,
-
-    GetSheetName = function(self)
-        return self.name
-    end,
-
-    GetTotalRows = function(self)
-        return #self.__rows
-    end,
-
-    GetTotalCols = function(self)
-        return #self.__cols
-    end,
-
-    Cell = function(self, row, col)
-        local key = ''
-        local extraColIndex = math.floor(col / 26)
-        if extraColIndex > 0 then
-            key = string.char(string.byte('A') + (extraColIndex - 1))
-        end
-        key = key .. string.char(string.byte('A') + (col % 26))
-        key = key .. (row + 1)
-        return self.__cells[key]
-    end,
-
-    __tostring = function(self)
-        return "xlsx.Sheet " .. self.name
+        stack[#stack + 1] = node
     end
-}
 
-__sheetMetatable.__index = function(self, key)
-    local value = __sheetMetatable[key]
-    if value then return value end
-    return self.__cells[key]
+    function callbacks.EndElement(_, name)
+        local node = table.remove(stack)
+        if node['#'] == nil then
+            node['#'] = ''
+        end
+    end
+
+    function callbacks.CharacterData(_, text)
+        if not text or text == '' then return end
+        local current = stack[#stack]
+        if type(current['#']) == 'table' then
+            return
+        end
+        current['#'] = (current['#'] or '') .. text
+    end
+
+    local parser = lxp.new(callbacks)
+    local ok, err, line, col = parser:parse(data)
+    if ok then
+        ok, err, line, col = parser:parse()
+    end
+    parser:close()
+
+    if not ok then
+        error(("XML parse error: %s (line %s, col %s)"):format(tostring(err), tostring(line), tostring(col)))
+    end
+
+    return root['#']
 end
 
+local function _xlsx_readdocument(tbl, documentName)
+    local xlsx = ZIP.open(tbl.filename)
+    local file = xlsx:open(documentName)
+    if not file then
+        xlsx:close()
+        return
+    end
 
-function Sheet(workbook, id, name)
-    local self = {}
-    self.workbook = workbook
-    self.id = id
-    self.name = name
-    self.loaded = false
-    self.__cells = {}
-    self.__cols = {}
-    self.__rows = {}
-    setmetatable(self, __sheetMetatable)
-    return self
+    local buffer
+    local stat = xlsx:stat(documentName)
+    if stat and stat.size and stat.size > 0 then
+        buffer = file:read(stat.size)
+    else
+        ---this is original logic, which I presume was due to a limitation of the previous xml reader;
+        ---keeping this chunk as a fallback just in case
+        local chunks = {}
+        while true do
+            local chunk = file:read(8192)
+            if not chunk or chunk == '' then break end
+            chunks[#chunks + 1] = chunk
+        end
+        buffer = table.concat(chunks)
+    end
+
+    xlsx:close(file)
+
+    if not buffer or buffer == '' then return end
+
+    return _xlsx_parsexml(buffer)
+end
+
+local function _xlsx_loadsheet(workbook, id, name)
+    local sheetDoc = _xlsx_readdocument(workbook, ("xl/worksheets/sheet%d.xml"):format(id))
+    local data = {}
+
+    local sheetData = sheetDoc and sheetDoc.worksheet[1]['#'].sheetData
+    local rowNodes = sheetData and sheetData[1]['#'].row
+
+    if rowNodes then
+        local headers = {}
+        local dataRowIndex = 0
+
+        for rowIdx, rowNode in ipairs(rowNodes) do
+            local rowValues = {}
+
+            if rowNode['#'].c then
+                for _, columnNode in ipairs(rowNode['#'].c) do
+                    local cellId = columnNode['@'].r
+                    local colLetters = cellId and cellId:match(colRowPattern)
+                    local colNum = 0
+                    if colLetters and colLetters ~= '' then
+                        for index = 1, #colLetters do
+                            colNum = colNum * 26 + (colLetters:byte(index) - A_BYTE + 1)
+                        end
+                    end
+
+                    local colType = columnNode['@'].t
+                    local value
+
+                    if columnNode['#'].v then
+                        value = columnNode['#'].v[1]['#']
+                        if colType == 's' then
+                            value = workbook.sharedStrings[tonumber(value) + 1]
+                        elseif colType == 'b' then
+                            value = (value == '1')
+                        elseif colType ~= 'str' then
+                            value = tonumber(value)
+                        end
+                    end
+
+                    rowValues[colNum] = value
+                end
+            end
+
+            if rowIdx == 1 then
+                for colNum, value in pairs(rowValues) do
+                    headers[colNum] = (value ~= nil and value ~= '') and tostring(value) or ('Column' .. colNum)
+                end
+            else
+                local record = {}
+                for colNum, value in pairs(rowValues) do
+                    record[headers[colNum] or ('Column' .. colNum)] = value
+                end
+                dataRowIndex = dataRowIndex + 1
+                data[dataRowIndex] = record
+            end
+        end
+    end
+
+    return { name = name, data = data }
 end
 
 
@@ -270,8 +240,17 @@ local __workbookMetatable = {
     end
 }
 
+---@package
+---@class XlsxWorkbook
+---@field filename string Path the workbook was opened from.
+---@field sharedStrings string[] Raw shared-string table from xl/sharedStrings.xml.
+---@field workbookDoc table Parsed xl/workbook.xml document (internal, "@"/"#" shape).
+---@field __sheets {name:string, data:table[]}[] data table keys are column names and values are row values
 
-function M.Workbook(filename)
+---Opens an .xlsx file and parses its shared strings, workbook, manifest, and every worksheet.
+---@param filename string Path to the .xlsx file to read.
+---@return XlsxWorkbook
+function lib.Workbook(filename)
     local self = {}
     self.filename = filename
 
@@ -295,31 +274,14 @@ function M.Workbook(filename)
         end
     end
 
-    local stylesXml = _xlsx_readdocument(self, 'xl/styles.xml')
-    self.styles = {}
-    local cellXfs = {}
-    self.styles.cellXfs = cellXfs
-    if stylesXml then
-        for _, xfXml in ipairs(stylesXml.styleSheet[1]['#'].cellXfs[1]['#'].xf) do
-            local xf = {}
-            local numFmtId = xfXml['@'].numFmtId
-            if numFmtId then
-                xf.numFmtId = tonumber(numFmtId)
-            end
-            cellXfs[#cellXfs + 1] = xf
-        end
-    end
-
     self.workbookDoc = _xlsx_readdocument(self, 'xl/workbook.xml')
     local sheets = self.workbookDoc.workbook[1]['#'].sheets
     self.__sheets = {}
     local id = 1
     for _, sheetNode in ipairs(sheets[1]['#'].sheet) do
         local name = sheetNode['@'].name
-        local sheet = Sheet(self, id, name)
-        sheet:__load()
+        local sheet = _xlsx_loadsheet(self, id, name)
         self.__sheets[id] = sheet
-        self.__sheets[name] = sheet
         id = id + 1
     end
 
@@ -327,4 +289,4 @@ function M.Workbook(filename)
     return self
 end
 
-return M
+return lib
