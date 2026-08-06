@@ -1,5 +1,5 @@
 package = "lua-xlsx"
-version = "0.1-1"
+version = "0.1.1-1"
 source = {
     url = "git://github.com/saspivey98/lua-xlsx",
 }
@@ -11,9 +11,9 @@ description = {
     license = "MIT",
 }
 dependencies = {
-    "lua >= 5.3",
+    "lua >= 5.1",
     "lua-zip >= 0.2-0",
-    "luaexpat" >= "1.5.2"
+    "luaexpat >= 1.5.2"
 }
 build = {
     type="builtin",
